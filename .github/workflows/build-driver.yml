@@ -1,0 +1,92 @@
+name: Build driver
+
+# Builds the freedreno/Turnip driver from whatever is currently sitting
+# in vendor/upstream/ (kept current by sync-upstream.yml) and publishes
+# the result as a GitHub Release, mirroring how MojoLauncher/LTW
+# publishes its AAR build artifact.
+
+on:
+  workflow_run:
+    workflows: ["Sync upstream (freedreno_turnip-CI)"]
+    types: [completed]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Confirm vendored script is present
+        run: |
+          test -f vendor/upstream/turnip_builder.sh || {
+            echo "vendor/upstream/turnip_builder.sh missing — run the sync workflow first." >&2
+            exit 1
+          }
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang llvm ccache python3-mako \
+            python3-pip patchelf flex bison glslang-tools \
+            libwayland-dev wayland-protocols libxrandr-dev libxxf86vm-dev \
+            libxcb-glx0-dev libx11-xcb-dev pkg-config unzip zip curl
+          # Ubuntu 24.04's apt meson (1.3.2) is too old for current Mesa
+          # (needs >= 1.4.0). Install a current one via pip instead; it
+          # lands in /usr/local/bin, which comes before /usr/bin on PATH.
+          sudo pip3 install --break-system-packages -U meson
+          meson --version
+
+      - name: Run the vendored turnip builder
+        working-directory: vendor/upstream
+        run: bash turnip_builder.sh
+
+      - name: Show build logs on failure
+        if: failure()
+        working-directory: vendor/upstream
+        run: |
+          echo "----- meson_log (tail) -----"
+          tail -n 200 turnip_workdir/meson_log 2>/dev/null || echo "(no meson_log)"
+          echo "----- ninja_log (tail) -----"
+          tail -n 200 turnip_workdir/ninja_log 2>/dev/null || echo "(no ninja_log)"
+
+      - name: Locate build output
+        id: artifact
+        working-directory: vendor/upstream
+        run: |
+          # The raw compiled .so, still under its real name, before the
+          # script renames/soname-patches it into vulkan.turnip.so /
+          # vulkan.freedreno.so for Magisk/AdrenoTools packaging. This is
+          # the exact filename Copper-Android's native loader dlopen()s.
+          RAW_SO="$(find turnip_workdir -path '*/build-android-aarch64/src/freedreno/vulkan/libvulkan_freedreno.so' | head -n1)"
+          if [ -z "$RAW_SO" ]; then
+            echo "Could not find the raw built libvulkan_freedreno.so under turnip_workdir/." >&2
+            find turnip_workdir -maxdepth 6 -iname '*.so' >&2 || true
+            exit 1
+          fi
+          mkdir -p dist
+          cp "$RAW_SO" dist/libvulkan_freedreno.so
+          echo "so_path=vendor/upstream/dist/libvulkan_freedreno.so" >> "$GITHUB_OUTPUT"
+
+      - name: Read synced upstream commit
+        id: upstream
+        run: |
+          SHA="$(grep upstream_commit= vendor/UPSTREAM_COMMIT.txt | cut -d= -f2)"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: "Turnip driver build ${{ github.run_number }} (upstream ${{ steps.upstream.outputs.sha }})"
+          body: "Built from MojoLauncher/freedreno_turnip-CI @ ${{ steps.upstream.outputs.sha }}."
+          files: ${{ steps.artifact.outputs.so_path }}

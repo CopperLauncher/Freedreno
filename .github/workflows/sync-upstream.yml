@@ -1,0 +1,54 @@
+name: Sync upstream (freedreno_turnip-CI)
+
+# Keeps vendor/upstream/ in lockstep with MojoLauncher/freedreno_turnip-CI
+# with zero manual file copying. Runs on a schedule and can be triggered
+# on demand from the Actions tab.
+
+on:
+  schedule:
+    # Once a day at 05:00 UTC — plenty to catch upstream's biweekly
+    # release cadence without hammering their repo. Adjust as you like.
+    - cron: "0 5 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Run sync script
+        run: bash scripts/sync-upstream.sh
+
+      - name: Check for changes
+        id: diff
+        run: |
+          if git status --porcelain | grep -q .; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit and push if upstream moved
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          UPSTREAM_SHA="$(grep upstream_commit= vendor/UPSTREAM_COMMIT.txt | cut -d= -f2)"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add vendor/
+          git commit -m "sync: update vendor/upstream to MojoLauncher/freedreno_turnip-CI@${UPSTREAM_SHA:0:7}"
+          git push
+
+      - name: No changes
+        if: steps.diff.outputs.changed == 'false'
+        run: echo "Upstream unchanged, nothing to commit."
